@@ -1,9 +1,8 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
-import { Send, Mic, Play, Square, Settings2, FileText, MessageSquare, RefreshCw } from 'lucide-react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Send, Mic, Phone, PhoneOff, Settings2, FileText, MessageSquare, RefreshCw, ArrowLeft, Globe, Link } from 'lucide-react';
 import { cn } from '@/lib/utils';
-// import { useChat } from '@ai-sdk/react'; // No longer used due to runtime errors
 import ReactMarkdown from 'react-markdown';
 
 // Simple Toast Component
@@ -31,12 +30,13 @@ interface LabInterfaceProps {
         system_prompt_chat?: string;
         system_prompt_voice?: string;
         context_file_urls?: string[];
+        website_urls?: string[];
         knowledge_base_markdown?: string;
     };
 }
 
 export default function LabInterface({ initialData }: LabInterfaceProps) {
-    console.log("🧪 LabInterface cargado con datos:", initialData); // DEBUG: Verificar qué llegó al Lab
+    console.log("🧪 LabInterface cargado con datos:", initialData);
     const [activeTab, setActiveTab] = useState<'chat' | 'voice'>('chat');
 
     // Toast State
@@ -46,7 +46,7 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
     const [knowledgeBaseText, setKnowledgeBaseText] = useState<string>('');
     const [isParsing, setIsParsing] = useState(false);
 
-    // Config / Prompt Editor State (Hidden from UI but needed for logic)
+    // Config / Prompt Editor State
     const [systemPrompt, setSystemPrompt] = useState(initialData.system_prompt_chat || '');
     const [voicePrompt, setVoicePrompt] = useState(initialData.system_prompt_voice || '');
 
@@ -54,14 +54,33 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
     const [feedbackTarget, setFeedbackTarget] = useState<'chat' | 'voice'>('chat');
     const [feedbackText, setFeedbackText] = useState('');
 
-    // Sync feedback target with active tab when tab changes
+    // Chat State
+    const [messages, setMessages] = useState<any[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [input, setInput] = useState('');
+
+    // ===== VOICE BOT STATE (WebSocket Native Audio) =====
+    const [isVoiceConnected, setIsVoiceConnected] = useState(false);
+    const [isVoiceListening, setIsVoiceListening] = useState(false);
+    const [voiceTranscription, setVoiceTranscription] = useState('');
+    const [voiceError, setVoiceError] = useState<string | null>(null);
+
+    // Voice Refs
+    const sessionRef = useRef<any>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const outputAudioContextRef = useRef<AudioContext | null>(null);
+    const nextStartTimeRef = useRef<number>(0);
+    const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
+    const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+    const streamRef = useRef<MediaStream | null>(null);
+
+    // Sync feedback target with active tab
     useEffect(() => {
         setFeedbackTarget(activeTab);
     }, [activeTab]);
 
     // Parse files on load OR use pre-loaded data
     useEffect(() => {
-        // If we already have the parsed text from onboarding, use it!
         if (initialData.knowledge_base_markdown) {
             setKnowledgeBaseText(initialData.knowledge_base_markdown);
             return;
@@ -77,13 +96,11 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 });
                 const data = await res.json();
 
-                // If markdown is found, use it.
                 if (data.error) {
                     setKnowledgeBaseText(`ERROR API: ${data.error}`);
                 } else if (data.markdown && data.markdown.trim()) {
                     setKnowledgeBaseText(data.markdown);
                 } else if (data.debug_raw) {
-                    // Start of Debugging: If no markdown, show the raw structure so we can fix it
                     setKnowledgeBaseText("DEBUG - RAW RESPONSE:\n" + JSON.stringify(data.debug_raw, null, 2));
                 } else {
                     setKnowledgeBaseText('Sin contenido legible (ni datos de depuración).');
@@ -98,109 +115,228 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
         fetchKnowledgeBase();
     }, [initialData.context_file_urls, initialData.knowledge_base_markdown]);
 
-    const [messages, setMessages] = useState<any[]>([]);
-    const [isLoading, setIsLoading] = useState(false);
-    const [input, setInput] = useState('');
-    const [isRecording, setIsRecording] = useState(false);
-    const audioChunksRef = useRef<Blob[]>([]);
-    const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+    // ===== VOICE BOT: WebSocket Native Audio =====
 
-    const startRecording = async () => {
+    // Dynamic import helpers (client-side only)
+    const audioHelpersRef = useRef<any>(null);
+    const genaiRef = useRef<any>(null);
+
+    const loadDependencies = async () => {
+        if (!audioHelpersRef.current) {
+            audioHelpersRef.current = await import('@/lib/audioHelpers');
+        }
+        if (!genaiRef.current) {
+            const { GoogleGenAI, Modality } = await import('@google/genai');
+            genaiRef.current = { GoogleGenAI, Modality };
+        }
+        return { helpers: audioHelpersRef.current, genai: genaiRef.current };
+    };
+
+    const stopVoiceCall = useCallback(() => {
+        console.log("🛑 Stopping voice call...");
+        if (sessionRef.current) {
+            try { sessionRef.current.close(); } catch (e) { }
+            sessionRef.current = null;
+        }
+        if (scriptProcessorRef.current) {
+            scriptProcessorRef.current.disconnect();
+            scriptProcessorRef.current = null;
+        }
+        if (streamRef.current) {
+            streamRef.current.getTracks().forEach(t => t.stop());
+            streamRef.current = null;
+        }
+        sourcesRef.current.forEach(source => {
+            try { source.stop(); } catch (e) { }
+        });
+        sourcesRef.current.clear();
+        setIsVoiceConnected(false);
+        setIsVoiceListening(false);
+    }, []);
+
+    const startVoiceCall = async () => {
         try {
+            setVoiceError(null);
+            setIsVoiceListening(true);
+            setVoiceTranscription('');
+
+            // 1. Load dependencies
+            const { helpers, genai } = await loadDependencies();
+            const { GoogleGenAI, Modality } = genai;
+            const { decode, decodeAudioData, createBlob } = helpers;
+
+            // 2. Get API Key
+            const tokenRes = await fetch('/api/gemini-token');
+            const tokenData = await tokenRes.json();
+            if (!tokenData.apiKey) throw new Error("No API key available");
+
+            const ai = new GoogleGenAI({ apiKey: tokenData.apiKey });
+
+            // 3. Setup Audio Contexts
+            if (!audioContextRef.current) {
+                audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
+            }
+            if (!outputAudioContextRef.current) {
+                outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+            }
+
+            // 4. Get Microphone
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const recorder = new MediaRecorder(stream);
-            mediaRecorderRef.current = recorder;
-            audioChunksRef.current = [];
+            streamRef.current = stream;
 
-            recorder.ondataavailable = (e) => {
-                if (e.data.size > 0) audioChunksRef.current.push(e.data);
-            };
+            // 5. Build system instruction with knowledge base
+            const fullSystemPrompt = [
+                voicePrompt || "Eres un asistente virtual amable y profesional.",
+                knowledgeBaseText ? `\n\nBASE DE CONOCIMIENTO:\n${knowledgeBaseText}` : '',
+                messages.length > 0 ? `\n\nHISTORIAL DE CONVERSACIÓN:\n${messages.map(m => `${m.role}: ${m.content}`).join('\n')}` : ''
+            ].join('');
 
-            recorder.onstop = () => {
-                const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-                handleSendAudio(audioBlob);
-                stream.getTracks().forEach(track => track.stop());
-            };
+            console.log("🎤 Connecting to Gemini Native Audio...");
 
-            recorder.start();
-            setIsRecording(true);
-        } catch (error) {
-            console.error("Error accessing microphone:", error);
-            alert("No se pudo acceder al micrófono.");
-        }
-    };
+            // 6. Connect via Live API
+            const session = await ai.live.connect({
+                model: 'gemini-2.5-flash-native-audio-preview-09-2025',
+                config: {
+                    responseModalities: [Modality.AUDIO],
+                    systemInstruction: fullSystemPrompt,
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Zephyr' } },
+                    },
+                    outputAudioTranscription: {},
+                    inputAudioTranscription: {},
+                },
+                callbacks: {
+                    onopen: () => {
+                        console.log("✅ Connected to Gemini Native Audio!");
+                        setIsVoiceConnected(true);
 
-    const stopRecording = () => {
-        if (mediaRecorderRef.current && isRecording) {
-            mediaRecorderRef.current.stop();
-            setIsRecording(false);
-        }
-    };
+                        // Setup mic streaming
+                        const source = audioContextRef.current!.createMediaStreamSource(stream);
+                        const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
+                        scriptProcessorRef.current = scriptProcessor;
 
-    const handleSendAudio = async (audioBlob: Blob) => {
-        setIsLoading(true);
-        try {
-            // Convert Blob to Base64
-            const reader = new FileReader();
-            reader.readAsDataURL(audioBlob);
-            reader.onloadend = async () => {
-                const base64Audio = (reader.result as string).split(',')[1];
+                        scriptProcessor.onaudioprocess = (event) => {
+                            const inputData = event.inputBuffer.getChannelData(0);
+                            if (sessionRef.current) {
+                                sessionRef.current.sendRealtimeInput({ media: createBlob(inputData) });
+                            }
+                        };
+                        source.connect(scriptProcessor);
+                        scriptProcessor.connect(audioContextRef.current!.destination);
 
-                const userMsg = { role: 'user', content: '🎤 [Audio Message]' };
-                const newMessages = [...messages, userMsg];
-                setMessages(newMessages);
+                        // Send warmup + initial nudge
+                        const nudgeData = new Float32Array(4000).fill(0.001);
+                        sessionRef.current?.sendRealtimeInput({ media: createBlob(nudgeData) });
 
-                // Send to API
-                console.log("🎤 Sending Audio to API...", { size: base64Audio.length });
-                const response = await fetch('/api/chat-lab', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        messages: newMessages,
-                        systemPrompt: voicePrompt,
-                        knowledgeBase: knowledgeBaseText,
-                        audioData: base64Audio // Sending Base64 audio
-                    })
-                });
+                        // Send initial message to bot
+                        setTimeout(() => {
+                            if (sessionRef.current) {
+                                sessionRef.current.sendClientContent({
+                                    turns: [{ role: 'user', parts: [{ text: "SISTEMA: Inicia la conversación. Saluda cordialmente según tu rol. NO menciones botones ni interfaces." }] }],
+                                    turnComplete: true
+                                });
+                            }
+                        }, 2000);
+                    },
+                    onmessage: async (message: any) => {
+                        const parts = message.serverContent?.modelTurn?.parts;
+                        if (parts) {
+                            for (const part of parts) {
+                                // Play audio chunks
+                                if (part.inlineData?.data) {
+                                    const ctx = outputAudioContextRef.current!;
+                                    nextStartTimeRef.current = Math.max(nextStartTimeRef.current, ctx.currentTime);
+                                    const buffer = await decodeAudioData(decode(part.inlineData.data), ctx, 24000, 1);
+                                    const audioSource = ctx.createBufferSource();
+                                    audioSource.buffer = buffer;
+                                    audioSource.connect(ctx.destination);
+                                    audioSource.addEventListener('ended', () => sourcesRef.current.delete(audioSource));
+                                    audioSource.start(nextStartTimeRef.current);
+                                    nextStartTimeRef.current += buffer.duration;
+                                    sourcesRef.current.add(audioSource);
+                                }
+                            }
+                        }
 
-                if (!response.ok) {
-                    const errText = await response.text();
-                    console.error("API Error Response:", errText);
-                    throw new Error(`API Error ${response.status}: ${errText}`);
+                        // User transcription (input)
+                        if (message.serverContent?.inputTranscription) {
+                            const userTxt = message.serverContent.inputTranscription.text;
+                            if (userTxt?.trim()) {
+                                setMessages(prev => {
+                                    const last = prev[prev.length - 1];
+                                    if (last && last.role === 'user' && last.isPartial) {
+                                        const updated = [...prev];
+                                        updated[updated.length - 1] = { ...last, content: last.content + userTxt };
+                                        return updated;
+                                    }
+                                    return [...prev, { role: 'user', content: userTxt, isPartial: true }];
+                                });
+                            }
+                        }
+
+                        // Bot transcription (output)
+                        if (message.serverContent?.outputTranscription) {
+                            const txt = message.serverContent.outputTranscription.text;
+                            if (txt) {
+                                setVoiceTranscription(prev => prev + txt);
+                            }
+                        }
+
+                        // Turn complete: commit bot transcription to history
+                        if (message.serverContent?.turnComplete) {
+                            setVoiceTranscription(prev => {
+                                const text = prev.trim();
+                                if (text) {
+                                    setMessages(msgs => {
+                                        // Finalize any partial user messages
+                                        const updated = msgs.map(m => m.isPartial ? { ...m, isPartial: false } : m);
+                                        return [...updated, { role: 'assistant', content: text }];
+                                    });
+                                }
+                                return '';
+                            });
+                        }
+
+                        // Interruption: stop playing, save partial
+                        if (message.serverContent?.interrupted) {
+                            setVoiceTranscription(prev => {
+                                if (prev.trim()) {
+                                    setMessages(msgs => [...msgs, { role: 'assistant', content: prev.trim() + "..." }]);
+                                }
+                                return '';
+                            });
+                            sourcesRef.current.forEach(s => { try { s.stop(); } catch (e) { } });
+                            sourcesRef.current.clear();
+                            nextStartTimeRef.current = 0;
+                        }
+                    },
+                    onerror: (e: any) => {
+                        console.error('Gemini Voice Error:', e);
+                        setVoiceError('⚠️ Conexión perdida. Intenta reconectar.');
+                        setIsVoiceConnected(false);
+                    },
+                    onclose: () => {
+                        console.log("Conexión cerrada");
+                        setIsVoiceConnected(false);
+                        setIsVoiceListening(false);
+                    }
                 }
+            });
 
-                if (!response.body) return;
-
-                // Stream response (Assistant Text)
-                // NOTE: For Native Audio generic response, we might receive text or audio back.
-                // For now, assuming the model returns TEXT as per standard chat implementation.
-                // If the user wants AUDIO back, we need TTS. The prompt implied "Voice Bot" uses Native Audio *Input*.
-
-                let assistantContent = "";
-                setMessages(prev => [...prev, { role: 'assistant', content: "" }]);
-
-                const streamReader = response.body.getReader();
-                const decoder = new TextDecoder();
-
-                while (true) {
-                    const { done, value } = await streamReader.read();
-                    if (done) break;
-                    const chunk = decoder.decode(value, { stream: true });
-                    assistantContent += chunk;
-                    setMessages(prev => {
-                        const updated = [...prev];
-                        updated[updated.length - 1] = { role: 'assistant', content: assistantContent };
-                        return updated;
-                    });
-                }
-            };
-        } catch (error: any) {
-            console.error("Error sending audio:", error);
-            setMessages(prev => [...prev, { role: 'assistant', content: `❌ Error de Audio: ${error.message}` }]);
-        } finally {
-            setIsLoading(false);
+            sessionRef.current = session;
+        } catch (err: any) {
+            console.error("Voice call error:", err);
+            setVoiceError(`Error: ${err.message}`);
+            setIsVoiceListening(false);
         }
     };
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => { stopVoiceCall(); };
+    }, [stopVoiceCall]);
+
+    // ===== TEXT CHAT =====
 
     const handleSendMessage = async (e?: React.FormEvent) => {
         e?.preventDefault();
@@ -219,16 +355,14 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     messages: newMessages,
-                    systemPrompt: activeTab === 'chat' ? systemPrompt : voicePrompt,
-                    knowledgeBase: knowledgeBaseText // Pass the parsed text directly
+                    systemPrompt: systemPrompt,
+                    knowledgeBase: knowledgeBaseText
                 })
             });
 
             if (!response.ok) throw new Error("Error en la petición: " + response.statusText);
-
             if (!response.body) return;
 
-            // Initialize assistant message
             let assistantContent = "";
             setMessages(prev => [...prev, { role: 'assistant', content: "" }]);
 
@@ -242,7 +376,6 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 const chunk = decoder.decode(value, { stream: true });
                 assistantContent += chunk;
 
-                // Update last message
                 setMessages(prev => {
                     const updated = [...prev];
                     updated[updated.length - 1] = { role: 'assistant', content: assistantContent };
@@ -251,16 +384,15 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
             }
         } catch (error: any) {
             console.error("Error sending message:", error);
-            // alert("Error: " + error.message); // Don't use alert, show in chat
-            setMessages(prev => [...prev, { role: 'assistant', content: `❌ Error: ${error.message}. Verifica la consola o intenta de nuevo.` }]);
+            setMessages(prev => [...prev, { role: 'assistant', content: `❌ Error: ${error.message}` }]);
         } finally {
             setIsLoading(false);
         }
     };
 
-    // Helper for input binding
     const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => setInput(e.target.value);
-    const safeHandleSubmit = handleSendMessage; // Alias for compatibility with previous form code
+
+    // ===== FEEDBACK / MAGIC =====
 
     const [isRefining, setIsRefining] = useState(false);
 
@@ -268,7 +400,6 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
         if (!feedbackText.trim() || isRefining) return;
         setIsRefining(true);
 
-        // Optimistic UI update? No, wait for result.
         try {
             const response = await fetch('/api/refine-lab', {
                 method: 'POST',
@@ -277,8 +408,6 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                     task: feedbackTarget,
                     currentPrompt: feedbackTarget === 'chat' ? systemPrompt : voicePrompt,
                     feedback: feedbackText
-                    // fileUrls: initialData.context_file_urls // REMOVED
-                    // knowledgeBase: knowledgeBaseText // REMOVED: User requested independent prompt refinement
                 })
             });
 
@@ -287,7 +416,6 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 try {
                     const errorData = await response.json();
                     errorMessage = errorData.error || errorData.message || errorMessage;
-                    if (errorData.stack) console.error("Server Stack:", errorData.stack);
                 } catch (e) {
                     const text = await response.text();
                     if (text) errorMessage = text;
@@ -297,14 +425,12 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
 
             const data = await response.json();
             if (data.newPrompt) {
-                // Update State
                 if (feedbackTarget === 'chat') {
                     setSystemPrompt(data.newPrompt);
                 } else {
                     setVoicePrompt(data.newPrompt);
                 }
 
-                // Persist to localStorage for reload safety
                 const updatedData = {
                     ...initialData,
                     system_prompt_chat: feedbackTarget === 'chat' ? data.newPrompt : systemPrompt,
@@ -315,8 +441,7 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 setToastMessage(`El prompt del ${feedbackTarget === 'chat' ? 'Chatbot' : 'Voicebot'} ha sido actualizado.`);
                 setTimeout(() => setToastMessage(null), 5000);
                 setFeedbackText('');
-                setMessages([]); // Start fresh interaction
-
+                setMessages([]);
             }
         } catch (error) {
             console.error("Error refining:", error);
@@ -326,6 +451,8 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
         }
     };
 
+    // ===== RENDER =====
+
     return (
         <div className="flex h-screen bg-[#0B1015] text-white overflow-hidden relative">
             {toastMessage && <Toast message={toastMessage} onClose={() => setToastMessage(null)} />}
@@ -333,10 +460,13 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
             <div className="w-1/3 border-r border-white/5 flex flex-col bg-[#121820]/50 backdrop-blur-xl">
                 <div className="p-4 border-b border-white/5 flex flex-col gap-2">
                     <div className="flex items-center justify-between">
-                        <h2 className="font-space font-bold text-lg flex items-center gap-2">
-                            <Settings2 className="w-5 h-5 text-purple-400" />
-                            Configuración
-                        </h2>
+                        <button
+                            onClick={() => window.location.href = '/onboarding'}
+                            className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-white transition-colors group"
+                        >
+                            <ArrowLeft className="w-4 h-4 group-hover:-translate-x-0.5 transition-transform" />
+                            <span>Onboarding</span>
+                        </button>
                         <span className="text-xs text-muted-foreground">{initialData.company_name}</span>
                     </div>
                     {/* Prompt Status Indicators */}
@@ -357,33 +487,40 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                 </div>
 
                 <div className="flex-1 overflow-y-auto p-4 space-y-6">
-                    {/* Knowledge Base Content */}
+                    {/* Knowledge Base Sources */}
                     <div className="space-y-2">
                         <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
                             <FileText className="w-4 h-4" />
-                            Base de Conocimiento (Markdown)
+                            Fuentes de Conocimiento
                         </label>
-                        <textarea
-                            className="w-full h-40 bg-black/20 border border-white/10 rounded-lg p-3 text-[10px] font-mono text-gray-400 focus:outline-none resize-none"
-                            value={isParsing ? "Leyendo archivos..." : knowledgeBaseText}
-                            readOnly
-                        />
-                    </div>
-
-                    {/* Current System Prompt */}
-                    <div className="space-y-2">
-                        <label className="text-sm font-medium text-gray-300 flex items-center gap-2">
-                            <Settings2 className="w-4 h-4" />
-                            Prompt del Sistema (Actual)
-                        </label>
-                        <textarea
-                            className="w-full h-40 bg-black/20 border border-white/10 rounded-lg p-3 text-[10px] font-mono text-green-400/80 focus:outline-none resize-none"
-                            value={activeTab === 'chat' ? systemPrompt : voicePrompt}
-                            readOnly
-                        />
-                        <p className="text-[10px] text-gray-500">
-                            *Este prompt se optimiza automáticamente con "Realizar Magia".
-                        </p>
+                        <div className="space-y-1.5">
+                            {/* Website URLs */}
+                            {initialData.website_urls && initialData.website_urls.length > 0 && (
+                                initialData.website_urls.map((url, idx) => (
+                                    <div key={`url-${idx}`} className="flex items-center gap-2 bg-black/20 border border-white/10 rounded-lg px-3 py-2 text-xs">
+                                        <Globe className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                                        <a href={url} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 truncate transition-colors">{url}</a>
+                                    </div>
+                                ))
+                            )}
+                            {/* Uploaded File URLs */}
+                            {initialData.context_file_urls && initialData.context_file_urls.length > 0 && (
+                                initialData.context_file_urls.map((fileUrl, idx) => {
+                                    const fileName = fileUrl.split('/').pop() || fileUrl;
+                                    return (
+                                        <div key={`file-${idx}`} className="flex items-center gap-2 bg-black/20 border border-white/10 rounded-lg px-3 py-2 text-xs">
+                                            <Link className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                                            <span className="text-gray-300 truncate" title={fileUrl}>{decodeURIComponent(fileName)}</span>
+                                        </div>
+                                    );
+                                })
+                            )}
+                            {/* No sources */}
+                            {(!initialData.website_urls || initialData.website_urls.length === 0) &&
+                                (!initialData.context_file_urls || initialData.context_file_urls.length === 0) && (
+                                    <p className="text-xs text-gray-500 italic">Sin fuentes cargadas.</p>
+                                )}
+                        </div>
                     </div>
 
                     {/* Feedback / Improvement Loop */}
@@ -463,10 +600,16 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                     >
                         <Mic className="w-4 h-4" /> Voicebot
                     </button>
-                    <div className="ml-auto">
+                    <div className="ml-auto flex items-center gap-2">
+                        {isVoiceConnected && activeTab === 'voice' && (
+                            <span className="flex items-center gap-1 text-[10px] text-green-400">
+                                <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
+                                Voz activa
+                            </span>
+                        )}
                         <button
                             className="p-2 hover:bg-white/10 rounded-full text-muted-foreground transition-colors"
-                            onClick={() => { setMessages([]); }}
+                            onClick={() => { setMessages([]); setVoiceTranscription(''); }}
                             title="Reiniciar Chat"
                         >
                             <RefreshCw className="w-4 h-4" />
@@ -476,7 +619,7 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
 
                 {/* Chat Area */}
                 <div className="flex-1 overflow-y-auto p-4 pt-20 pb-24 space-y-4">
-                    {messages.length === 0 && (
+                    {messages.length === 0 && !voiceTranscription && (
                         <div className="h-full flex flex-col items-center justify-center text-muted-foreground opacity-50">
                             <div className="w-16 h-16 rounded-full bg-white/5 flex items-center justify-center mb-4">
                                 {activeTab === 'chat' ? <MessageSquare className="w-8 h-8" /> : <Mic className="w-8 h-8" />}
@@ -492,6 +635,15 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                             </div>
                         </div>
                     ))}
+                    {/* Live bot transcription (streaming) */}
+                    {voiceTranscription && (
+                        <div className="flex justify-start">
+                            <div className="max-w-[80%] p-3 rounded-2xl text-sm bg-white/10 text-gray-200 rounded-tl-none">
+                                {voiceTranscription}
+                                <span className="animate-pulse">_</span>
+                            </div>
+                        </div>
+                    )}
                     {isLoading && (
                         <div className="flex justify-start">
                             <div className="bg-white/10 p-3 rounded-2xl rounded-tl-none flex gap-1">
@@ -514,9 +666,10 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                                 value={input}
                                 onChange={handleInputChange}
                                 disabled={isLoading}
+                                onKeyDown={(e) => { if (e.key === 'Enter') handleSendMessage(e); }}
                             />
                             <button
-                                onClick={(e) => safeHandleSubmit(e)}
+                                onClick={(e) => handleSendMessage(e)}
                                 className="p-2 bg-primary hover:bg-primary/90 rounded-full text-white transition-colors disabled:opacity-50"
                                 disabled={!input?.trim() || isLoading}
                             >
@@ -524,23 +677,34 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                             </button>
                         </div>
                     ) : (
-                        <div className="flex justify-center pb-4">
+                        <div className="flex flex-col items-center gap-3 pb-2">
+                            {voiceError && (
+                                <div className="bg-red-500/10 border border-red-500/30 p-2 rounded-lg text-red-400 text-xs text-center w-full max-w-sm">
+                                    {voiceError}
+                                </div>
+                            )}
                             <button
-                                onClick={isRecording ? stopRecording : startRecording}
-                                disabled={isLoading}
+                                onClick={isVoiceConnected ? stopVoiceCall : startVoiceCall}
                                 className={cn(
-                                    "w-16 h-16 rounded-full flex items-center justify-center transition-all shadow-2xl border-4",
-                                    isRecording
-                                        ? "bg-red-500 border-red-400 scale-110 animate-pulse shadow-red-500/50"
-                                        : "bg-purple-600 border-purple-400 hover:bg-purple-500 hover:scale-105 shadow-purple-500/30",
-                                    isLoading && "opacity-50 cursor-not-allowed bg-gray-600 border-gray-500"
+                                    "w-full max-w-sm py-3 rounded-xl font-bold text-sm transition-all flex items-center justify-center gap-2 transform active:scale-[0.98]",
+                                    isVoiceConnected
+                                        ? "bg-red-500/10 text-red-500 border border-red-500/20 hover:bg-red-500/20"
+                                        : "bg-purple-600 text-white hover:bg-purple-500 shadow-lg shadow-purple-500/30"
                                 )}
                             >
-                                <Mic className={cn("w-8 h-8 text-white", isRecording && "animate-bounce")} />
+                                {isVoiceConnected ? (
+                                    <>
+                                        <PhoneOff className="w-4 h-4" />
+                                        <span>Finalizar Llamada</span>
+                                        <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+                                    </>
+                                ) : (
+                                    <>
+                                        <Phone className="w-4 h-4" />
+                                        <span>{isVoiceListening ? 'Conectando...' : 'Iniciar Llamada de Voz'}</span>
+                                    </>
+                                )}
                             </button>
-                            <p className="absolute bottom-2 text-[10px] text-gray-500 pointer-events-none">
-                                {isRecording ? "Click para enviar" : "Click para hablar"}
-                            </p>
                         </div>
                     )}
                 </div>

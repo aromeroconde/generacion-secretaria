@@ -93,7 +93,7 @@ export default function ChatInterface({ messages, onSendMessage, isLoading, onCo
 
     return (
         <div className="flex flex-col h-full relative">
-            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar pb-32">
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar pb-52">
                 {messages.map((msg, idx) => (
                     <div
                         key={idx}

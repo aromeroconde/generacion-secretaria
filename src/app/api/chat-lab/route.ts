@@ -4,59 +4,30 @@ import { streamText } from 'ai';
 export const maxDuration = 30;
 
 export async function POST(req: Request) {
-    const { messages, systemPrompt, knowledgeBase, audioData } = await req.json();
+    const { messages, systemPrompt, knowledgeBase } = await req.json();
 
-    console.log(`🤖 Chat Request. Content Length: ${knowledgeBase?.length || 0}. Audio: ${!!audioData}`);
+    console.log(`🤖 Chat Request. Content Length: ${knowledgeBase?.length || 0}`);
 
-    // Strict System Prompt Supplement
+    // System Prompt with Knowledge Base
     let strictSystem = `${systemPrompt}\n\nIMPORTANT: You have access to the KNOWLEDGE BASE provided below. Answer purely based on it. If the information is not in the Knowledge Base, say you don't know. Do NOT use external knowledge.`;
 
     if (knowledgeBase && knowledgeBase.trim()) {
         strictSystem += `\n\n--- KNOWLEDGE BASE START ---\n${knowledgeBase}\n--- KNOWLEDGE BASE END ---\n`;
     }
 
-    // Audio Debugging
-    if (audioData) {
-        console.log(`🎤 Server received audio. Length: ${audioData.length}`);
-    }
-
-    // Prepare Messages
-    let coreMessages: any[] = [];
-
-    if (audioData) {
-        // Voice Mode: Use Gemini 2.5 Native Audio
-        // We need to construct a multipart message for the latest user message
-        const previousMessages = messages.slice(0, -1).map((m: any) => ({
-            role: m.role,
-            content: m.content
-        }));
-
-        const lastMessage = {
-            role: 'user',
-            content: [
-                { type: 'text', text: 'Please respond to this audio input.' },
-                { type: 'file', data: audioData, mimeType: 'audio/wav' }
-            ]
-        };
-
-        coreMessages = [...previousMessages, lastMessage];
-    } else {
-        // Text Mode
-        coreMessages = messages.map((m: any) => ({
-            role: m.role,
-            content: m.content
-        }));
-    }
+    const coreMessages = messages.map((m: any) => ({
+        role: m.role,
+        content: m.content
+    }));
 
     try {
-        const modelName = audioData
-            ? 'models/gemini-2.5-flash-native-audio'  // User requested specific model for voice
-            : 'models/gemini-3-flash-preview';        // Keep Gemini 3 for text chat
-
         const result = await streamText({
-            model: google(modelName),
+            model: google('models/gemini-3-flash-preview'),
             system: strictSystem,
             messages: coreMessages as any,
+            onFinish: (event) => {
+                console.log("🤖 Stream Finished. Reason:", event.finishReason);
+            },
         });
 
         return result.toTextStreamResponse();

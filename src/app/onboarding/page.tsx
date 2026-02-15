@@ -419,6 +419,7 @@ export default function OnboardingPage() {
                     system_prompt_chat: payload['prompt chatbot'] || payload.system_prompt_chat || "Eres una secretaria virtual útil.",
                     system_prompt_voice: payload['prompt voicebot'] || payload.system_prompt_voice || "Eres una secretaria virtual útil (voz).",
                     context_file_urls: validFileUrls,
+                    website_urls: summaryData.website_urls || [],
                     // Store the KB markdown if available
                     knowledge_base_markdown: kbData ? (kbData as any).markdown : ""
                 };
