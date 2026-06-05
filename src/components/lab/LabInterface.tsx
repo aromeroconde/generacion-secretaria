@@ -74,6 +74,13 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
     const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
 
+    // Reconnect state
+    const reconnectAttemptsRef = useRef(0);
+    const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const isManualRef = useRef(false);
+    const MAX_RECONNECT = 2;
+    const RECONNECT_DELAY_MS = 1000;
+
     // Sync feedback target with active tab
     useEffect(() => {
         setFeedbackTarget(activeTab);
@@ -134,6 +141,11 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
 
     const stopVoiceCall = useCallback(() => {
         console.log("🛑 Stopping voice call...");
+        isManualRef.current = true;
+        if (reconnectTimeoutRef.current) {
+            clearTimeout(reconnectTimeoutRef.current);
+            reconnectTimeoutRef.current = null;
+        }
         if (sessionRef.current) {
             try { sessionRef.current.close(); } catch (e) { }
             sessionRef.current = null;
@@ -159,18 +171,24 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
             setVoiceError(null);
             setIsVoiceListening(true);
             setVoiceTranscription('');
+            isManualRef.current = false;
+            reconnectAttemptsRef.current = 0;
 
             // 1. Load dependencies
             const { helpers, genai } = await loadDependencies();
             const { GoogleGenAI, Modality } = genai;
             const { decode, decodeAudioData, createBlob } = helpers;
 
-            // 2. Get API Key
+            // 2. Get ephemeral token from proxy (never exposes real API key)
             const tokenRes = await fetch('/api/gemini-token');
             const tokenData = await tokenRes.json();
-            if (!tokenData.apiKey) throw new Error("No API key available");
+            if (!tokenData.token) throw new Error(tokenData.error || "No token from proxy");
 
-            const ai = new GoogleGenAI({ apiKey: tokenData.apiKey });
+            const isEphemeral = (tokenData.token as string).startsWith('auth_tokens/');
+            const ai = new GoogleGenAI({
+                apiKey: tokenData.token,
+                ...(isEphemeral ? { httpOptions: { apiVersion: 'v1alpha' } } : {}),
+            });
 
             // 3. Setup Audio Contexts
             if (!audioContextRef.current) {
@@ -312,13 +330,20 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
                     },
                     onerror: (e: any) => {
                         console.error('Gemini Voice Error:', e);
-                        setVoiceError('⚠️ Conexión perdida. Intenta reconectar.');
-                        setIsVoiceConnected(false);
+                        if (!isManualRef.current && reconnectAttemptsRef.current < MAX_RECONNECT) {
+                            attemptReconnect();
+                        } else {
+                            setVoiceError('⚠️ Conexión perdida. Intenta reconectar.');
+                            stopVoiceCall();
+                        }
                     },
                     onclose: () => {
                         console.log("Conexión cerrada");
-                        setIsVoiceConnected(false);
-                        setIsVoiceListening(false);
+                        if (!isManualRef.current && reconnectAttemptsRef.current < MAX_RECONNECT) {
+                            attemptReconnect();
+                        } else {
+                            stopVoiceCall();
+                        }
                     }
                 }
             });
@@ -329,6 +354,37 @@ export default function LabInterface({ initialData }: LabInterfaceProps) {
             setVoiceError(`Error: ${err.message}`);
             setIsVoiceListening(false);
         }
+    };
+
+    const attemptReconnect = () => {
+        if (isManualRef.current || reconnectTimeoutRef.current) return;
+
+        reconnectAttemptsRef.current++;
+        const delay = RECONNECT_DELAY_MS * Math.pow(2, reconnectAttemptsRef.current - 1);
+
+        console.warn(`Reconnect attempt ${reconnectAttemptsRef.current}/${MAX_RECONNECT} in ${delay}ms`);
+
+        reconnectTimeoutRef.current = setTimeout(() => {
+            reconnectTimeoutRef.current = null;
+            if (isManualRef.current) return;
+
+            // Cleanup current broken session before reconnecting
+            if (sessionRef.current) {
+                try { sessionRef.current.close(); } catch (e) { }
+                sessionRef.current = null;
+            }
+            if (scriptProcessorRef.current) {
+                scriptProcessorRef.current.disconnect();
+                scriptProcessorRef.current = null;
+            }
+            sourcesRef.current.forEach(s => { try { s.stop(); } catch (e) { } });
+            sourcesRef.current.clear();
+            nextStartTimeRef.current = 0;
+            setIsVoiceConnected(false);
+            setIsVoiceListening(false);
+
+            startVoiceCall();
+        }, delay);
     };
 
     // Cleanup on unmount
